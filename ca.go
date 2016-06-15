@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime/pprof"
 	"strings"
 )
 
@@ -32,25 +31,36 @@ var tmpl = `<!DOCTYPE html>
 </head>
 
 <body>
-	{{range .Funcs}}
-	<p><a href={{.}}>{{.}}</a></p>
+{{range $key, $value := .Funcs}}
+	<p><a href={{$key}}>{{$key}}</a> <b>{{$value}}</b></p>
 	{{end}}
 </body>
 </html>
 `
 
 type CFunc struct {
-	name    string
-	params  string
-	body    string
-	calling map[string]*CFunc
-	called  map[string]*CFunc
+	name     string
+	params   string
+	body     string
+	filename string
+	calling  []*CFunc
 }
 
-type CFuncs struct {
-	Name  string
-	Funcs []string
+type Func struct {
+	Name     string
+	Filename string
 }
+type CFuncs struct {
+	Funcs map[string]string
+}
+
+type CMACRO struct {
+	name     string
+	value    string
+	filename string
+}
+
+var macroDB = make(map[string]*CMACRO, 1000)
 
 /*
     x,y        w ump
@@ -67,8 +77,6 @@ type CFuncGraph struct {
 	w, h                   int /* width, height */
 	umpx, umpy, dmpx, dmpy int /* up middler port, down middler point */
 	name                   string
-	chsw, chsh             int /* children grap start point */
-	children               map[string]*CFuncGraph
 	level                  int
 }
 
@@ -78,49 +86,135 @@ type Graph struct {
 	sw, sh         int /* Start point */
 	deltaw, deltah int /* delta value between to elements */
 	pix            int /* pixls */
+	rows           map[int]*RowGraph
+	graphs         map[string]*CFuncGraph
 }
 
-var constGraph = Graph{gw: 2000, gh: 2000, ew: 0, eh: 15, sw: 1000, sh: 40, deltaw: 20, deltah: 40, pix: 5}
+type RowGraph struct {
+	x, y    int
+	element []*CFuncGraph
+}
 
-var level = 0
+var constGraph = Graph{gw: 4000, gh: 4000, ew: 0, eh: 15, sw: 1000, sh: 40, deltaw: 20, deltah: 40, pix: 5}
+
+type CallTreeSPF struct {
+	root   string
+	vertex map[string]*SPFVertex
+	rows   map[int][]*SPFVertex
+	level  int
+}
+
+type SPFVertex struct {
+	fn       *CFunc
+	level    int
+	drawed   bool
+	children []*SPFVertex
+}
+
+var filterFuncList = `sizeof, memset, memcpy, htons, ntohs, hton, ntoh, likely, in_irq, if, switch, for, while, dev_net`
 
 var CFuncList = make(map[string]*CFunc, 10000)
 
-var FetchFunction = regexp.MustCompile(`(?P<funcName>[[:word:]_]+)[[:space:]]*(?P<funcParams>\([[:word:][:space:]\-\>\,\_\*]*\))[[:space:]]+\{`)
+var FetchFunctionDefinition = regexp.MustCompile(`(?P<funcName>[[:word:]_]+)[[:space:]]*(?P<funcParams>\([[:word:][:space:]\-\>\,\_\*]*\))[[:space:]]+\{`)
+var FetchMACRODefinition = regexp.MustCompile(`[[:space:]]*#define[[:space:]]+(?P<MACROName>[[:word:]_]+)[[:space:]]+`)
 
-//var FetchFunction = regexp.MustCompile(`(?P<funcName>[[:word:]_]+)[[:space:]]*(?P<funcParams>\([[:word:][:space:]\*\,]*\))[[:space:]]+\{`)
+var FetchFunctionCall = regexp.MustCompile(`(?P<funcName>[[:word:]_]+)[[:space:]]*(?P<funcParams>\([[:word:][:space:]\-\>\,\_\*\&\-\>\"\'\(\)]*\))[[:space:]]*[\;\)\+\-\*\/\&\|\,\?]+`)
 
-func addNewFunc(buf []byte, funFigure string, funName string, funParams string) error {
+//var FetchFunctionCall = regexp.MustCompile(`(?P<funcName>[[:word:]_]+)[[:space:]]*(?P<funcParams>\([[:word:][:space:]\-\>\,\_\*\&\-\>]*\))[[:space:]]*\;+`)
+
+func (spf *CallTreeSPF) getSubVertex(v *CFunc) {
+	if v == nil || len(v.calling) == 0 {
+		return
+	}
+
+	spf.vertex[v.name].children = make([]*SPFVertex, 0, len(v.calling))
+	for _, fi := range v.calling {
+		if _, ok := spf.vertex[fi.name]; ok {
+			continue
+		}
+
+		if fi != nil {
+			nv := new(SPFVertex)
+			nv.fn = fi
+			nv.level = spf.vertex[v.name].level + 1
+			if spf.level < nv.level {
+				spf.level = nv.level
+			}
+			nv.drawed = false
+			spf.vertex[fi.name] = nv
+			spf.vertex[v.name].children = append(spf.vertex[v.name].children, nv)
+			spf.getSubVertex(fi)
+		}
+	}
+}
+
+func (spf *CallTreeSPF) getVertex() error {
+	if r, ok := CFuncList[spf.root]; ok {
+		spf.vertex = make(map[string]*SPFVertex, 200)
+		nv := new(SPFVertex)
+		nv.fn = r
+		nv.level = 0
+		nv.drawed = false
+		if spf.level < nv.level {
+			spf.level = nv.level
+		}
+		spf.vertex[spf.root] = nv
+		if len(r.calling) != 0 {
+			spf.getSubVertex(r)
+		}
+	}
+
+	spf.rows = make(map[int][]*SPFVertex, spf.level)
+	spf.rows[0] = append(spf.rows[0], spf.vertex[spf.root])
+	spf.vertex[spf.root].drawed = true
+	for l := 1; l <= spf.level; l++ {
+		for _, p := range spf.rows[l-1] {
+			for _, c := range p.children {
+				if spf.vertex[c.fn.name].drawed == true {
+					continue
+				}
+				spf.rows[l] = append(spf.rows[l], c)
+				spf.vertex[c.fn.name].drawed = true
+			}
+		}
+	}
+	/*
+		for _, v := range spf.vertex {
+			spf.rows[v.level] = append(spf.rows[v.level], v)
+		}
+	*/
+	return nil
+}
+
+func addNewFunc(filename string, buf []byte, funFigure string, funName string, funParams string) error {
 	if _, ok := CFuncList[funName]; ok {
 		return errors.New("Already exist: " + funName)
 	}
 	fun := new(CFunc)
 	fun.name = funName
 	fun.params = funParams
-	fun.body = string(getFuncBody(buf, funName+funParams))
-	fun.calling = make(map[string]*CFunc, 50)
-	fun.called = make(map[string]*CFunc, 50)
+	fun.filename = filename
+	fun.body = getFuncBody(string(buf), funFigure[:len(funFigure)-2]) /* For " {" */
 	CFuncList[funName] = fun
-
-	/*
-		fmt.Println(funName + funParams)
-		fmt.Println(fun.body)
-	*/
 
 	return nil
 }
 
-func createChildrenGraph(root *CFuncGraph, fn *CFunc) {
-	if fn == nil || len(fn.calling) == 0 {
-		return
+func buildRowGraph(level int, row []*SPFVertex) *RowGraph {
+	rg := new(RowGraph)
+	rlen := 0
+	for _, v := range row {
+		rlen = rlen + len(v.fn.name)*constGraph.pix + constGraph.deltaw
 	}
 
-	root.children = make(map[string]*CFuncGraph, len(fn.calling))
-	sw := root.chsw
-	sh := root.chsh
-	for k, f := range fn.calling {
+	rg.x = constGraph.sw - rlen/2
+	rg.y = constGraph.sh + (constGraph.eh+constGraph.deltah)*level
+	rg.element = make([]*CFuncGraph, 0, len(row))
+	sw := rg.x
+	sh := rg.y
+	for _, v := range row {
 		var graph = new(CFuncGraph)
-		graph.name = k
+		graph.name = v.fn.name
 		graph.x = sw
 		graph.y = sh
 		graph.w = len(graph.name) * constGraph.pix
@@ -131,120 +225,118 @@ func createChildrenGraph(root *CFuncGraph, fn *CFunc) {
 		graph.umpy = graph.y
 		graph.dmpx = graph.x + graph.w/2
 		graph.dmpy = graph.y + constGraph.eh
-		graph.level = 0
-		root.children[k] = graph
+		graph.level = level
+		rg.element = append(rg.element, graph)
+		constGraph.graphs[graph.name] = graph
 		sw += graph.w + constGraph.deltaw
-
-		chlen := 0
-		for i, _ := range f.calling {
-			chlen = chlen + len(i)*constGraph.pix + constGraph.deltaw
-		}
-		graph.chsw = graph.umpx - chlen/2
-		graph.chsh = graph.dmpy + constGraph.deltah + constGraph.eh
-
 	}
+
+	return rg
 }
 
-func drawGraph(w http.ResponseWriter, root *CFuncGraph) {
+func buildFuncCallTreeGraph(spf *CallTreeSPF) {
+	constGraph.rows = make(map[int]*RowGraph, spf.level)
+	constGraph.graphs = make(map[string]*CFuncGraph, len(spf.vertex))
+	for i, row := range spf.rows {
+		constGraph.rows[i] = buildRowGraph(i, row)
+	}
+
+}
+
+func drawFuncCallTree(w http.ResponseWriter, spf *CallTreeSPF) {
+	if spf == nil {
+		return
+	}
 	w.Header().Set("Content-Type", "image/svg+xml")
 	s := svg.New(w)
 	s.Start(constGraph.gw, constGraph.gh)
-	s.Roundrect(root.x, root.y, root.w, root.h, 1, 1, "fill:none;stroke:black")
-	s.Link(root.name, root.name)
-	s.Text(root.tx, root.ty, root.name, "text-anchor:middle;font-size:5px;fill:black")
-	s.LinkEnd()
-
-	if len(root.children) != 0 {
-		for _, g := range root.children {
+	for _, row := range constGraph.rows {
+		for _, g := range row.element {
 			s.Roundrect(g.x, g.y, g.w, g.h, 1, 1, "fill:none;stroke:black")
 			s.Link(g.name, g.name)
 			s.Text(g.tx, g.ty, g.name, "text-anchor:middle;font-size:5px;fill:black")
 			s.LinkEnd()
-			s.Line(root.dmpx, root.dmpy, g.umpx, g.umpy, "fill:none;stroke:black")
+		}
+	}
+
+	for _, v := range spf.vertex {
+		for _, subv := range v.children {
+			s.Line(constGraph.graphs[v.fn.name].dmpx, constGraph.graphs[v.fn.name].dmpy, constGraph.graphs[subv.fn.name].umpx, constGraph.graphs[subv.fn.name].umpy, "fill:none;stroke:black")
 		}
 	}
 	s.End()
-
 }
 
 func createFuncGraph(w http.ResponseWriter, r *http.Request) {
+	fmt.Println(r.URL.Path[1:])
 	if fn, ok := CFuncList[r.URL.Path[1:]]; ok {
-		var root = CFuncGraph{name: fn.name, x: constGraph.sw, y: constGraph.sh}
-		root.w = len(root.name) * constGraph.pix
-		root.h = constGraph.eh
-		root.tx = root.x + len(root.name)*constGraph.pix - (len(root.name)*constGraph.pix)/2
-		root.ty = root.y + constGraph.eh - constGraph.pix
-		root.umpx = root.x + root.w/2
-		root.umpy = root.y
-		root.dmpx = root.x + root.w/2
-		root.dmpy = root.y + constGraph.eh
-		root.level = 0
-
-		chlen := 0
-		for k, _ := range fn.calling {
-			chlen = chlen + len(k)*constGraph.pix + constGraph.deltaw
-		}
-		root.chsw = root.umpx - chlen/2
-		root.chsh = root.dmpy + constGraph.deltah + constGraph.eh
-
-		if len(fn.calling) != 0 {
-			createChildrenGraph(&root, fn)
-		}
-
-		drawGraph(w, &root)
+		spf := new(CallTreeSPF)
+		spf.root = fn.name
+		spf.level = 0
+		spf.getVertex()
+		buildFuncCallTreeGraph(spf)
+		drawFuncCallTree(w, spf)
 	} else {
 		io.WriteString(w, "No exit in global list\n")
 	}
 }
 
 func buildCallTree() {
-	for fn, fi := range CFuncList {
-		for k, f := range CFuncList {
-			if strings.Contains(fi.body, k) {
-				fi.calling[k] = f
-				f.called[fn] = fi
+	for _, fi := range CFuncList {
+		if FetchFunctionCall.MatchString(fi.body) {
+			callList := FetchFunctionCall.FindAllStringSubmatch(fi.body, -1)
+			var callbackCount = 0
+			for _, cf := range callList {
+				params := strings.Split(cf[2][1:len(cf[2])-1], ",")
+				for _, p := range params {
+					p = strings.Replace(p, " ", "", -1)
+					if _, ok := CFuncList[p]; ok {
+						callbackCount++
+					}
+				}
+			}
+			fi.calling = make([]*CFunc, 0, len(callList)+callbackCount)
+			for _, cf := range callList {
+				if e, ok := CFuncList[cf[1]]; ok {
+					fi.calling = append(fi.calling, e)
+					params := strings.Split(cf[2][1:len(cf[2])-1], ",")
+					for _, p := range params {
+						p = strings.Replace(p, " ", "", -1)
+						if cb, ok := CFuncList[p]; ok {
+							fi.calling = append(fi.calling, cb)
+						}
+					}
+				} else {
+					if strings.Contains(filterFuncList, cf[1]) {
+						continue
+					}
+
+					if _, ok := macroDB[cf[1]]; ok {
+						continue
+					}
+					nf := new(CFunc)
+					nf.name = cf[1]
+					nf.params = cf[2]
+					fi.calling = append(fi.calling, nf)
+					params := strings.Split(cf[2][1:len(cf[2])-1], ",")
+					for _, p := range params {
+						p := strings.Replace(p, " ", "", -1)
+						if cb, ok := CFuncList[p]; ok {
+							fi.calling = append(fi.calling, cb)
+						}
+					}
+				}
 			}
 		}
-	}
-}
-
-func dumpFuncCall(fn *CFunc) {
-	if fn == nil {
-		return
-	}
-	if len(fn.calling) == 0 {
-		return
-	}
-
-	for _, f := range fn.calling {
-		if f != nil {
-			if f == fn {
-				continue
+		/*
+			for k, f := range CFuncList {
+				funcCallRe := regexp.MustCompile(k + `[[:space:]]*\([[:word:][:space:]\,\-\>\*\&\!\+\=]*\)`)
+				if funcCallRe.MatchString(fi.body) {
+					fi.calling[k] = f
+					f.called[fn] = fi
+				}
 			}
-
-			if _, ok := f.calling[fn.name]; ok {
-				continue
-			}
-			fmt.Printf("---------------->" + f.name)
-			fmt.Printf("Calling ")
-			dumpFuncCall(f)
-		}
-	}
-	return
-}
-
-func dumpCallTree() {
-	for n, f := range CFuncList {
-		level = 0
-		fmt.Println("")
-		fmt.Printf("[ " + n + " ] ")
-		fmt.Println("Calling :")
-		for _, fn := range f.calling {
-			if fn != nil {
-				fmt.Printf("\t" + fn.name + "\n")
-			}
-		}
-		//dumpFuncCall(f)
+		*/
 	}
 }
 
@@ -256,7 +348,6 @@ func dumpFuncList(w http.ResponseWriter, req *http.Request) {
 	sh := 500
 	s.Start(100000, 100000)
 	for v, _ := range CFuncList {
-		fmt.Println(v)
 		s.Roundrect(sw, sh, len(v)*5, h, 1, 1, "fill:none;stroke:black")
 		s.Text((sw+len(v)*5)-(len(v)*5)/2, sh+10, v, "text-anchor:middle;font-size:5px;fill:black")
 
@@ -267,16 +358,15 @@ func dumpFuncList(w http.ResponseWriter, req *http.Request) {
 
 func showFuncList(w http.ResponseWriter, req *http.Request) {
 	req.ParseForm()
-	fmt.Println("Method: ", req.Method)
 	fmt.Println("Path: ", req.URL.Path)
-	var funcList = CFuncs{Name: "", Funcs: make([]string, 0, len(CFuncList))}
+	var funcList = CFuncs{Funcs: make(map[string]string, len(CFuncList))}
 
 	if req.URL.Path == "/" {
 		for fn, fi := range CFuncList {
 			if len(fi.calling) == 0 {
 				continue
 			}
-			funcList.Funcs = append(funcList.Funcs, fn)
+			funcList.Funcs[fn] = fi.filename
 		}
 		t, err := template.New("main").Parse(tmpl)
 		if err != nil {
@@ -289,46 +379,11 @@ func showFuncList(w http.ResponseWriter, req *http.Request) {
 	}
 
 	createFuncGraph(w, req)
-	/*
-		fmt.Println("--------------")
-		fmt.Println(req.URL.Path[1:])
-		if fn, ok := CFuncList[req.URL.Path[1:]]; ok {
-			fmt.Println("++++++++++++++++++++++++++")
-			funcList.Name = fn.name
-			for name, _ := range fn.calling {
-				funcList.Funcs = append(funcList.Funcs, name)
-			}
-
-			fmt.Println(funcList.Funcs)
-			if len(funcList.Funcs) != 0 {
-				w.Header().Set("Content-Type", "image/svg+xml")
-				s := svg.New(w)
-				h := 15
-				sw := 100
-				sh := 100
-				s.Start(1000, 500)
-				for _, v := range funcList.Funcs {
-					s.Roundrect(sw, sh, len(v)*5, h, 1, 1, "fill:none;stroke:black")
-					s.Link(v, v)
-					s.Text((sw+len(v)*5)-(len(v)*5)/2, sh+10, v, "text-anchor:middle;font-size:5px;fill:black")
-					s.LinkEnd()
-
-					sw += len(v)*5 + 20
-				}
-				s.End()
-			} else {
-				io.WriteString(w, "Nothing\n")
-			}
-		} else {
-			io.WriteString(w, "No exit in global list\n")
-		}
-	*/
 }
 
-func getFuncBody(buf []byte, figure string) []byte {
-	index := strings.Index(string(buf), figure)
+func getFuncBody(buf string, figure string) string {
+	index := strings.Index(buf, figure)
 	body := buf[index+len(figure):]
-
 	var brace_count = 0
 	var bsize = 0
 	var bstart = 0
@@ -347,7 +402,7 @@ func getFuncBody(buf []byte, figure string) []byte {
 			}
 		}
 	}
-	body = body[bstart : bstart+bsize]
+	body = body[bstart : bstart+bsize-1]
 	return body
 }
 
@@ -365,16 +420,20 @@ func getFuncList(filename string) error {
 		os.Exit(-2)
 	}
 
-	//	fmt.Println(strings.TrimSpace(strings.Replace(strings.Replace(strings.Trim(strings.Trim(strings.Trim(string(buf), "\n"), "\t"), " "), "\n", " ", -1), "\t", " ", -1)))
-
 	fstr := strings.TrimSpace(strings.Replace(strings.Replace(strings.Trim(strings.Trim(strings.Trim(string(buf), "\n"), "\t"), " "), "\n", " ", -1), "\t", " ", -1))
-	if FetchFunction.MatchString(fstr) {
-		funcList := FetchFunction.FindAllStringSubmatch(fstr, -1)
+	if FetchMACRODefinition.MatchString(fstr) {
+		macroList := FetchMACRODefinition.FindAllStringSubmatch(fstr, -1)
+		for _, m := range macroList {
+			macro := new(CMACRO)
+			macro.name = m[1]
+			macro.filename = filename
+			macroDB[m[1]] = macro
+		}
+	}
+	if FetchFunctionDefinition.MatchString(fstr) {
+		funcList := FetchFunctionDefinition.FindAllStringSubmatch(fstr, -1)
 		for _, v := range funcList {
 			if v[1] != "if" && v[1] != "switch" && v[1] != "for" && v[1] != "while" {
-				//				fmt.Println(FetchFunction.SubexpNames()[1])
-				//				fmt.Println(FetchFunction.SubexpNames()[2])
-				//				fmt.Println(v[2])
 				if !strings.Contains(v[2], "void") {
 					if strings.Contains(v[2], ",") {
 						if params := strings.Split(v[2], ","); params != nil {
@@ -382,48 +441,40 @@ func getFuncList(filename string) error {
 								continue
 							}
 						}
-						//	fmt.Println(v[1])
-						//	fmt.Println(v[2])
-						addNewFunc([]byte(fstr), v[0], v[1], v[2])
+						addNewFunc(filename, []byte(fstr), v[0], v[1], v[2])
 
 					} else {
 						if !strings.Contains(v[2], " ") {
 							continue
 						} else {
-							//		fmt.Println(v[1])
-							//		fmt.Println(v[2])
-							addNewFunc([]byte(fstr), v[0], v[1], v[2])
+							addNewFunc(filename, []byte(fstr), v[0], v[1], v[2])
 						}
 
 					}
 				} else {
-					//fmt.Println(v[1])
-					//fmt.Println(v[2])
-					addNewFunc([]byte(fstr), v[0], v[1], v[2])
+					addNewFunc(filename, []byte(fstr), v[0], v[1], v[2])
 				}
 			}
 		}
 	}
 
 	/*
-		//	fmt.Println(string(buf))
-		fmt.Println(strings.TrimSpace(string(buf)))
-		if FetchFunction.Match(buf) {
-			funcList := FetchFunction.FindAllSubmatch(buf, -1)
+		if FetchFunctionCall.MatchString(fstr) {
+			funcList := FetchFunctionCall.FindAllStringSubmatch(fstr, -1)
 			for _, v := range funcList {
-				fmt.Printf("%q\n", v[0])
+				fmt.Println(v[1])
 			}
 		}
 	*/
-	return nil
 
+	return nil
 }
 
 func fileParse(filename string, fi os.FileInfo, err error) error {
 	if fi.IsDir() {
 		fmt.Println("DIR " + filename)
 	} else {
-		if strings.HasSuffix(filename, ".c") {
+		if strings.HasSuffix(filename, ".c") || strings.HasSuffix(filename, ".h") {
 			getFuncList(filename)
 		}
 	}
@@ -431,34 +482,32 @@ func fileParse(filename string, fi os.FileInfo, err error) error {
 }
 
 func main() {
-	f, _ := os.Create("pprofile_file")
-	pprof.StartCPUProfile(f)
-	//	defer pprof.StopCPUProfile()
-
-	if len(os.Args) != 2 {
+	if len(os.Args) < 2 {
 		usuage()
 		os.Exit(1)
 	}
 
-	fInfo, err := os.Lstat(os.Args[1])
-	if err != nil {
-		usuage()
-		fmt.Println(err.Error())
-		os.Exit(2)
-	}
+	list := strings.Split(os.Args[1], " ")
+	for _, arg := range list {
+		fInfo, err := os.Lstat(arg)
+		if err != nil {
+			usuage()
+			fmt.Println(err.Error())
+			os.Exit(2)
+		}
 
-	if fInfo.IsDir() {
-		err = filepath.Walk(os.Args[1], fileParse)
-	} else {
-		fmt.Println("File " + os.Args[1])
-		getFuncList(os.Args[1])
+		if fInfo.IsDir() {
+			err = filepath.Walk(arg, fileParse)
+		} else {
+			fmt.Println("File " + arg)
+			getFuncList(arg)
+		}
 	}
 
 	buildCallTree()
-	dumpCallTree()
 	http.Handle("/", http.HandlerFunc(showFuncList))
 	http.Handle("/circle", http.HandlerFunc(dumpFuncList))
-	err = http.ListenAndServe(":2003", nil)
+	err := http.ListenAndServe(":2003", nil)
 	if err != nil {
 		fmt.Println(err.Error())
 	}
